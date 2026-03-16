@@ -240,6 +240,20 @@ impl PakReader {
         self.pak.index.entries().keys().cloned().collect()
     }
 
+    /// Returns file paths ordered by on-disk data offset.
+    /// Use this for sequential reads to reduce seek overhead.
+    pub fn files_by_offset(&self) -> Vec<&str> {
+        let mut pairs: Vec<(&str, u64)> = self
+            .pak
+            .index
+            .entries()
+            .iter()
+            .map(|(k, e)| (k.as_str(), e.offset))
+            .collect();
+        pairs.sort_unstable_by_key(|&(_, offset)| offset);
+        pairs.into_iter().map(|(k, _)| k).collect()
+    }
+
     pub fn used_compression(&self) -> Vec<Compression> {
         let mut used_compression = vec![0; self.pak.compression.len()];
         for entry in self.pak.index.entries.values() {
@@ -430,7 +444,6 @@ impl Pak {
             crate::data::decrypt(profile, key, &mut index)?;
         }
 
-
         let mut index = io::Cursor::new(index);
         let mount_point = index.read_string()?;
         let len = index.read_u32::<LE>()? as usize;
@@ -438,98 +451,90 @@ impl Pak {
         let index = if version.version_major() >= VersionMajor::PathHashIndex {
             let path_hash_seed = index.read_u64::<LE>()?;
 
-            // Left in for potential desire to verify path index hashes.
-            let _path_hash_index = if index.read_u32::<LE>()? != 0 {
-                let path_hash_index_offset = index.read_u64::<LE>()?;
-                let path_hash_index_size = index.read_u64::<LE>()?;
+            if index.read_u32::<LE>()? != 0 {
+                let _path_hash_index_offset = index.read_u64::<LE>()?;
+                let _path_hash_index_size = index.read_u64::<LE>()?;
                 let _path_hash_index_hash = index.read_len(20)?;
+            }
 
-                reader.seek(io::SeekFrom::Start(path_hash_index_offset))?;
-                let mut path_hash_index_buf = reader.read_len(path_hash_index_size as usize)?;
-                // TODO verify hash
-
-                if footer.encrypted {
-                    #[cfg(not(feature = "encryption"))]
-                    return Err(super::Error::Encryption);
-                    #[cfg(feature = "encryption")]
-                    crate::data::decrypt(profile, key, &mut path_hash_index_buf)?;
-                }
-
-                let mut path_hash_index = vec![];
-                let mut phi_reader = io::Cursor::new(&mut path_hash_index_buf);
-                for _ in 0..phi_reader.read_u32::<LE>()? {
-                    let hash = phi_reader.read_u64::<LE>()?;
-                    let encoded_entry_offset = phi_reader.read_u32::<LE>()?;
-                    path_hash_index.push((hash, encoded_entry_offset));
-                }
-
-                Some(path_hash_index)
-            } else {
-                None
-            };
-
-            // Left in for potential desire to verify full directory index hashes.
-            let full_directory_index = if index.read_u32::<LE>()? != 0 {
+            let fdi_bytes = if index.read_u32::<LE>()? != 0 {
                 let full_directory_index_offset = index.read_u64::<LE>()?;
                 let full_directory_index_size = index.read_u64::<LE>()?;
                 let _full_directory_index_hash = index.read_len(20)?;
 
                 reader.seek(io::SeekFrom::Start(full_directory_index_offset))?;
                 #[allow(unused_mut)]
-                let mut full_directory_index =
-                    reader.read_len(full_directory_index_size as usize)?;
-                // TODO verify hash
+                let mut buf = reader.read_len(full_directory_index_size as usize)?;
 
                 if footer.encrypted {
                     #[cfg(not(feature = "encryption"))]
                     return Err(super::Error::Encryption);
                     #[cfg(feature = "encryption")]
-                    crate::data::decrypt(profile, key, &mut full_directory_index)?;
+                    crate::data::decrypt(profile, key, &mut buf)?;
                 }
-                let mut fdi = io::Cursor::new(full_directory_index);
-
-                let dir_count = fdi.read_u32::<LE>()? as usize;
-                let mut directories = BTreeMap::new();
-                for _ in 0..dir_count {
-                    let dir_name = fdi.read_string()?;
-                    let file_count = fdi.read_u32::<LE>()? as usize;
-                    let mut files = BTreeMap::new();
-                    for _ in 0..file_count {
-                        let file_name = fdi.read_string()?;
-                        files.insert(file_name, fdi.read_u32::<LE>()?);
-                    }
-                    directories.insert(dir_name, files);
-                }
-                Some(directories)
+                Some(buf)
             } else {
                 None
             };
             let size = index.read_u32::<LE>()? as usize;
             let encoded_entries = index.read_len(size)?;
+            let non_encoded_entry_count = index.read_u32::<LE>()? as usize;
+            let mut non_encoded_entries = Vec::with_capacity(non_encoded_entry_count);
+            for _ in 0..non_encoded_entry_count {
+                non_encoded_entries.push(Entry::read(&mut index, version)?);
+            }
 
             let mut entries_by_path = BTreeMap::new();
-            if let Some(fdi) = &full_directory_index {
+            if let Some(fdi_buf) = fdi_bytes {
+                let mut fdi = io::Cursor::new(fdi_buf);
                 let mut encoded_entries = io::Cursor::new(&encoded_entries);
-                for (dir_name, dir) in fdi {
-                    for (file_name, encoded_offset) in dir {
-                        if *encoded_offset == 0x80000000 {
-                            println!("{file_name:?} has invalid offset: 0x{encoded_offset:08x}");
+                let dir_count = fdi.read_u32::<LE>()? as usize;
+                for _ in 0..dir_count {
+                    let dir_name = fdi.read_string()?;
+                    let file_count = fdi.read_u32::<LE>()? as usize;
+                    for _ in 0..file_count {
+                        let name_pos = fdi.position();
+                        let name_len = fdi.read_i32::<LE>()?;
+                        let byte_count =
+                            if name_len < 0 { (-name_len) as i64 * 2 } else { name_len as i64 };
+                        fdi.seek(io::SeekFrom::Current(byte_count))?;
+                        let encoded_offset = fdi.read_i32::<LE>()?;
+
+                        // i32::MIN (0x80000000) is a deleted/pruned entry sentinel in UE5 paks.
+                        if encoded_offset == i32::MIN {
                             continue;
                         }
-                        encoded_entries.seek(io::SeekFrom::Start(*encoded_offset as u64))?;
-                        let entry =
-                            super::entry::Entry::read_encoded(&mut encoded_entries, version)?;
+
+                        let after_offset_pos = fdi.position();
+                        fdi.set_position(name_pos);
+                        let file_name = fdi.read_string()?;
+                        fdi.set_position(after_offset_pos);
+
+                        let entry = if encoded_offset >= 0 {
+                            encoded_entries
+                                .seek(io::SeekFrom::Start(encoded_offset as u64))?;
+                            super::entry::Entry::read_encoded(&mut encoded_entries, version)?
+                        } else {
+                            let entry_idx = (-encoded_offset) as usize - 1;
+                            non_encoded_entries
+                                .get(entry_idx)
+                                .ok_or_else(|| {
+                                    super::Error::Other(format!(
+                                        "non-encoded entry index {entry_idx} out of bounds (count: {})",
+                                        non_encoded_entries.len()
+                                    ))
+                                })?
+                                .clone()
+                        };
                         let path = format!(
                             "{}{}",
-                            dir_name.strip_prefix('/').unwrap_or(dir_name),
+                            dir_name.strip_prefix('/').unwrap_or(&dir_name),
                             file_name
                         );
                         entries_by_path.insert(path, entry);
                     }
                 }
             }
-
-            assert_eq!(index.read_u32::<LE>()?, 0, "remaining index bytes are 0"); // TODO possibly remaining unencoded entries?
 
             Index {
                 path_hash_seed: Some(path_hash_seed),
