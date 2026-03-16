@@ -390,9 +390,11 @@ impl EntryBuilder {
         data: D,
         path: &str,
     ) -> Result<PartialEntry<D>, Error> {
-        let compression = compress
-            .then_some(self.allowed_compression.as_slice())
-            .unwrap_or_default();
+        let compression = if compress {
+            self.allowed_compression.as_slice()
+        } else {
+            Default::default()
+        };
         build_partial_entry(
             compression,
             data,

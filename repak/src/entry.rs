@@ -98,6 +98,7 @@ impl Entry {
         size
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn write_file<W: io::Write + io::Seek>(
         writer: &mut W,
         version: Version,
@@ -333,6 +334,7 @@ impl Entry {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn read_file<R: io::Read + io::Seek, W: io::Write>(
         &self,
         reader: &mut R,
@@ -432,7 +434,7 @@ impl Entry {
                             decompressed.chunks_mut(chunk_size).zip(ranges)
                         {
                             let out =
-                                oodle_loader::oodle()?.decompress(&data[comp_range], decomp_chunk);
+                                oodle_loader::oodle()?.decompress(&data[comp_range], decomp_chunk)?;
                             if out == 0 {
                                 return Err(Error::DecompressionFailed(Compression::Oodle));
                             }
