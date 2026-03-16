@@ -524,7 +524,7 @@ fn pack(args: ActionPack) -> Result<(), repak::Error> {
                         if args.verbose {
                             log.println(format!("packing {}", &rel));
                         }
-                        let entry = entry_builder.build_entry(true, std::fs::read(p)?)?;
+                        let entry = entry_builder.build_entry(true, std::fs::read(p)?, rel)?;
 
                         tx.send((rel.to_string(), entry)).unwrap();
                         Ok(())
