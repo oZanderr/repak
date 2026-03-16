@@ -24,6 +24,7 @@ thiserror = "2.0"
 sha1 = { workspace = true }
 strum = { workspace = true }
 hex.workspace = true
+base64.workspace = true
 
 [dev-dependencies]
 base64 = { workspace = true }
