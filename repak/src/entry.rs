@@ -5,13 +5,13 @@ use byteorder::{ReadBytesExt, WriteBytesExt, LE};
 use std::io;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
-pub(crate) enum EntryLocation {
+pub enum EntryLocation {
     Data,
     Index,
 }
 
 #[derive(Debug, Default, Clone)]
-pub(crate) struct Block {
+pub struct Block {
     pub start: u64,
     pub end: u64,
 }
@@ -48,8 +48,8 @@ enum CompressionIndexSize {
     U32,
 }
 
-#[derive(Debug, Default, Clone)]
-pub(crate) struct Entry {
+#[derive(Debug,Clone)]
+pub struct Entry {
     pub offset: u64,
     pub compressed: u64,
     pub uncompressed: u64,
@@ -104,8 +104,13 @@ impl Entry {
         compression_slots: &mut Vec<Option<Compression>>,
         allowed_compression: &[Compression],
         data: &[u8],
+        #[allow(unused)] key: &super::Key,
+        profile: crate::PakProfile,
+        mount_point: &str,
+        path: &str,
     ) -> Result<Self, Error> {
-        let partial_entry = build_partial_entry(allowed_compression, data)?;
+        let partial_entry =
+            build_partial_entry(allowed_compression, data, key, profile, mount_point, path)?;
         let stream_position = writer.stream_position()?;
         let entry = partial_entry.build_entry(version, compression_slots, stream_position)?;
         entry.write(writer, version, crate::entry::EntryLocation::Data)?;
@@ -131,7 +136,7 @@ impl Entry {
         let timestamp = (ver == VersionMajor::Initial).then_try(|| reader.read_u64::<LE>())?;
         let hash = Some(Hash(reader.read_guid()?));
         let blocks = (ver >= VersionMajor::CompressionEncryption && compression.is_some())
-            .then_try(|| reader.read_array(Block::read))?;
+            .then_try(|| super::ext::ReadExt::read_array(reader, Block::read))?;
         let flags = (ver >= VersionMajor::CompressionEncryption)
             .then_try(|| reader.read_u8())?
             .unwrap_or(0);
@@ -282,11 +287,6 @@ impl Entry {
         let is_uncompressed_size_32_bit_safe = self.uncompressed <= u32::MAX as u64;
         let is_offset_32_bit_safe = self.offset <= u32::MAX as u64;
 
-        assert!(
-            compression_blocks_count < 0x10_000,
-            "compression blocks count fits in 16 bits"
-        );
-
         let flags = (compression_block_size)
             | (compression_blocks_count << 6)
             | ((self.is_encrypted() as u32) << 22)
@@ -339,29 +339,30 @@ impl Entry {
         version: Version,
         compression: &[Option<Compression>],
         #[allow(unused)] key: &super::Key,
+        profile: crate::PakProfile,
         buf: &mut W,
+        mount_point: &str,
+        path: &str,
     ) -> Result<(), super::Error> {
         reader.seek(io::SeekFrom::Start(self.offset))?;
         Entry::read(reader, version)?;
         #[cfg(any(feature = "compression", feature = "oodle"))]
         let data_offset = reader.stream_position()?;
+
         #[allow(unused_mut)]
         let mut data = reader.read_len(match self.is_encrypted() {
             true => align(self.compressed),
             false => self.compressed,
         } as usize)?;
+
+        let limit = (profile.encrypt_prefix)(mount_point, path, data.len()).min(data.len());
+
         if self.is_encrypted() {
             #[cfg(not(feature = "encryption"))]
             return Err(super::Error::Encryption);
             #[cfg(feature = "encryption")]
             {
-                let super::Key::Some(key) = key else {
-                    return Err(super::Error::Encrypted);
-                };
-                use aes::cipher::BlockDecrypt;
-                for block in data.chunks_mut(16) {
-                    key.decrypt_block(aes::Block::from_mut_slice(block))
-                }
+                crate::data::decrypt(profile, key, &mut data[..limit])?;
                 data.truncate(self.compressed as usize);
             }
         }
@@ -445,6 +446,23 @@ impl Entry {
         }
         buf.flush()?;
         Ok(())
+    }
+}
+
+struct Cap<S> {
+    s: S,
+    buf: Vec<u8>,
+}
+impl<S> Cap<S> {
+    fn new(s: S) -> Self {
+        Self { s, buf: vec![] }
+    }
+}
+impl<S: std::io::Read> std::io::Read for Cap<S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.s.read(buf).inspect(|len| {
+            self.buf.extend_from_slice(&buf[..*len]);
+        })
     }
 }
 

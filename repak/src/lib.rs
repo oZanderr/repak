@@ -1,12 +1,14 @@
 #![allow(dead_code)]
 mod data;
-mod entry;
+pub mod entry;
 mod error;
 mod ext;
 mod footer;
 mod pak;
+mod profile;
+pub mod utils;
 
-pub use {data::PartialEntry, error::*, pak::*};
+pub use {data::PartialEntry, error::*, pak::*, profile::{normalize_joined_path, PakProfile}};
 
 pub const MAGIC: u32 = 0x5A6F12E1;
 
@@ -111,9 +113,7 @@ impl Version {
     }
 }
 
-#[derive(
-    Clone, Copy, PartialEq, Eq, Debug, strum::Display, strum::EnumString, strum::VariantNames,
-)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, strum::Display, strum::EnumString, strum::VariantNames)]
 pub enum Compression {
     Zlib,
     Gzip,
@@ -121,10 +121,14 @@ pub enum Compression {
     Zstd,
     LZ4,
 }
-
+impl Default for Compression {
+    fn default() -> Self {
+        Compression::Oodle
+    }
+}
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Default)]
-pub(crate) enum Key {
+#[derive(Debug, Default, Clone)]
+pub enum Key {
     #[cfg(feature = "encryption")]
     Some(aes::Aes256),
     #[default]

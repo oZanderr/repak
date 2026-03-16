@@ -1,5 +1,6 @@
-use crate::data::build_partial_entry;
+use crate::data::{build_partial_entry, pad_length};
 use crate::entry::Entry;
+use crate::profile::PakProfile;
 use crate::{Compression, Error, PartialEntry};
 
 use super::ext::{ReadExt, WriteExt};
@@ -8,8 +9,8 @@ use byteorder::{ReadBytesExt, WriteBytesExt, LE};
 use std::collections::BTreeMap;
 use std::io::{self, Read, Seek, Write};
 
-#[derive(Default, Clone, Copy)]
-pub(crate) struct Hash(pub(crate) [u8; 20]);
+#[derive(Default, Clone, Copy, PartialEq)]
+pub struct Hash(pub(crate) [u8; 20]);
 impl std::fmt::Debug for Hash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Hash({})", hex::encode(self.0))
@@ -20,6 +21,7 @@ impl std::fmt::Debug for Hash {
 pub struct PakBuilder {
     key: super::Key,
     allowed_compression: Vec<Compression>,
+    profile: PakProfile,
 }
 
 impl Default for PakBuilder {
@@ -33,6 +35,7 @@ impl PakBuilder {
         Self {
             key: Default::default(),
             allowed_compression: Default::default(),
+            profile: Default::default(),
         }
     }
     #[cfg(feature = "encryption")]
@@ -45,15 +48,19 @@ impl PakBuilder {
         self.allowed_compression = compression.into_iter().collect();
         self
     }
+    pub fn profile(mut self, profile: PakProfile) -> Self {
+        self.profile = profile;
+        self
+    }
     pub fn reader<R: Read + Seek>(self, reader: &mut R) -> Result<PakReader, super::Error> {
-        PakReader::new_any_inner(reader, self.key)
+        PakReader::new_any_inner(reader, self.key, self.profile)
     }
     pub fn reader_with_version<R: Read + Seek>(
         self,
         reader: &mut R,
         version: super::Version,
     ) -> Result<PakReader, super::Error> {
-        PakReader::new_inner(reader, version, self.key)
+        PakReader::new_inner(reader, version, self.key, self.profile)
     }
     pub fn writer<W: Write + Seek>(
         self,
@@ -65,6 +72,7 @@ impl PakBuilder {
         PakWriter::new_inner(
             writer,
             self.key,
+            self.profile,
             version,
             mount_point,
             path_hash_seed,
@@ -73,7 +81,7 @@ impl PakBuilder {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PakReader {
     pak: Pak,
     key: super::Key,
@@ -87,11 +95,12 @@ pub struct PakWriter<W: Write + Seek> {
     allowed_compression: Vec<Compression>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Pak {
+    profile: PakProfile,
     version: Version,
     mount_point: String,
-    index_offset: Option<u64>,
+    pub index_offset: Option<u64>,
     index: Index,
     encrypted_index: bool,
     encryption_guid: Option<u128>,
@@ -99,8 +108,14 @@ pub(crate) struct Pak {
 }
 
 impl Pak {
-    fn new(version: Version, mount_point: String, path_hash_seed: Option<u64>) -> Self {
+    fn new(
+        profile: PakProfile,
+        version: Version,
+        mount_point: String,
+        path_hash_seed: Option<u64>,
+    ) -> Self {
         Pak {
+            profile,
             version,
             mount_point,
             index_offset: None,
@@ -120,7 +135,7 @@ impl Pak {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct Index {
     path_hash_seed: Option<u64>,
     entries: BTreeMap<String, super::entry::Entry>,
@@ -147,29 +162,17 @@ impl Index {
     }
 }
 
-#[cfg(feature = "encryption")]
-fn decrypt(key: &super::Key, bytes: &mut [u8]) -> Result<(), super::Error> {
-    if let super::Key::Some(key) = key {
-        use aes::cipher::BlockDecrypt;
-        for chunk in bytes.chunks_mut(16) {
-            key.decrypt_block(aes::Block::from_mut_slice(chunk))
-        }
-        Ok(())
-    } else {
-        Err(super::Error::Encrypted)
-    }
-}
-
 impl PakReader {
     fn new_any_inner<R: Read + Seek>(
         reader: &mut R,
         key: super::Key,
+        profile: PakProfile,
     ) -> Result<Self, super::Error> {
         use std::fmt::Write;
         let mut log = "\n".to_owned();
 
         for ver in Version::iter() {
-            match Pak::read(&mut *reader, ver, &key) {
+            match Pak::read(&mut *reader, ver, &key, profile) {
                 Ok(pak) => return Ok(Self { pak, key }),
                 Err(err) => writeln!(log, "trying version {} failed: {}", ver, err)?,
             }
@@ -181,8 +184,9 @@ impl PakReader {
         reader: &mut R,
         version: super::Version,
         key: super::Key,
+        profile: PakProfile,
     ) -> Result<Self, super::Error> {
-        Pak::read(reader, version, &key).map(|pak| Self { pak, key })
+        Pak::read(reader, version, &key, profile).map(|pak| Self { pak, key })
     }
 
     pub fn version(&self) -> super::Version {
@@ -223,7 +227,10 @@ impl PakReader {
                 self.pak.version,
                 &self.pak.compression,
                 &self.key,
+                self.pak.profile,
                 writer,
+                self.mount_point(),
+                path,
             ),
             None => Err(super::Error::MissingEntry(path.to_owned())),
         }
@@ -243,6 +250,7 @@ impl PakReader {
                 *count += 1;
             }
         }
+
         used_compression
             .into_iter()
             .zip(self.pak.compression.iter())
@@ -250,6 +258,12 @@ impl PakReader {
             .collect()
     }
 
+    pub fn get_file_entry(&self, path: &str) -> Result<Entry, Error> {
+        match self.pak.index.entries().get(path) {
+            Some(entry) => Ok((*entry).clone()),
+            None => Err(super::Error::MissingEntry(path.to_owned())),
+        }
+    }
     pub fn into_pakwriter<W: Write + Seek>(
         self,
         mut writer: W,
@@ -268,13 +282,14 @@ impl<W: Write + Seek> PakWriter<W> {
     fn new_inner(
         writer: W,
         key: super::Key,
+        profile: PakProfile,
         version: Version,
         mount_point: String,
         path_hash_seed: Option<u64>,
         allowed_compression: Vec<Compression>,
     ) -> Self {
         PakWriter {
-            pak: Pak::new(version, mount_point, path_hash_seed),
+            pak: Pak::new(profile, version, mount_point, path_hash_seed),
             writer,
             key,
             allowed_compression,
@@ -303,6 +318,10 @@ impl<W: Write + Seek> PakWriter<W> {
                     &[]
                 },
                 data.as_ref(),
+                &self.key,
+                self.pak.profile,
+                &self.pak.mount_point,
+                path,
             )?,
         );
 
@@ -312,6 +331,9 @@ impl<W: Write + Seek> PakWriter<W> {
     pub fn entry_builder(&self) -> EntryBuilder {
         EntryBuilder {
             allowed_compression: self.allowed_compression.clone(),
+            key: self.key.clone(),
+            mount_point: self.pak.mount_point.clone(),
+            profile: self.pak.profile,
         }
     }
 
@@ -355,6 +377,10 @@ impl AsRef<[u8]> for Data<'_> {
 #[derive(Clone)]
 pub struct EntryBuilder {
     allowed_compression: Vec<Compression>,
+    #[allow(unused)]
+    key: super::Key,
+    mount_point: String,
+    profile: PakProfile,
 }
 impl EntryBuilder {
     /// Builds an entry in memory (compressed if requested) which must be written out later
@@ -362,13 +388,19 @@ impl EntryBuilder {
         &self,
         compress: bool,
         data: D,
+        path: &str,
     ) -> Result<PartialEntry<D>, Error> {
-        let compression = if compress {
-            self.allowed_compression.as_slice()
-        } else {
-            &[]
-        };
-        build_partial_entry(compression, data)
+        let compression = compress
+            .then_some(self.allowed_compression.as_slice())
+            .unwrap_or_default();
+        build_partial_entry(
+            compression,
+            data,
+            &self.key,
+            self.profile,
+            &self.mount_point,
+            path,
+        )
     }
 }
 
@@ -377,12 +409,14 @@ impl Pak {
         reader: &mut R,
         version: super::Version,
         #[allow(unused)] key: &super::Key,
+        profile: PakProfile,
     ) -> Result<Self, super::Error> {
         // read footer to get index, encryption & compression info
         reader.seek(io::SeekFrom::End(-version.size()))?;
         let footer = super::footer::Footer::read(reader, version)?;
         // read index to get all the entry info
         reader.seek(io::SeekFrom::Start(footer.index_offset))?;
+
         #[allow(unused_mut)]
         let mut index = reader.read_len(footer.index_size as usize)?;
 
@@ -391,8 +425,9 @@ impl Pak {
             #[cfg(not(feature = "encryption"))]
             return Err(super::Error::Encryption);
             #[cfg(feature = "encryption")]
-            decrypt(key, &mut index)?;
+            crate::data::decrypt(profile, key, &mut index)?;
         }
+
 
         let mut index = io::Cursor::new(index);
         let mount_point = index.read_string()?;
@@ -415,14 +450,14 @@ impl Pak {
                     #[cfg(not(feature = "encryption"))]
                     return Err(super::Error::Encryption);
                     #[cfg(feature = "encryption")]
-                    decrypt(key, &mut path_hash_index_buf)?;
+                    crate::data::decrypt(profile, key, &mut path_hash_index_buf)?;
                 }
 
                 let mut path_hash_index = vec![];
                 let mut phi_reader = io::Cursor::new(&mut path_hash_index_buf);
                 for _ in 0..phi_reader.read_u32::<LE>()? {
                     let hash = phi_reader.read_u64::<LE>()?;
-                    let encoded_entry_offset = phi_reader.read_i32::<LE>()?;
+                    let encoded_entry_offset = phi_reader.read_u32::<LE>()?;
                     path_hash_index.push((hash, encoded_entry_offset));
                 }
 
@@ -447,7 +482,7 @@ impl Pak {
                     #[cfg(not(feature = "encryption"))]
                     return Err(super::Error::Encryption);
                     #[cfg(feature = "encryption")]
-                    decrypt(key, &mut full_directory_index)?;
+                    crate::data::decrypt(profile, key, &mut full_directory_index)?;
                 }
                 let mut fdi = io::Cursor::new(full_directory_index);
 
@@ -459,7 +494,7 @@ impl Pak {
                     let mut files = BTreeMap::new();
                     for _ in 0..file_count {
                         let file_name = fdi.read_string()?;
-                        files.insert(file_name, fdi.read_i32::<LE>()?);
+                        files.insert(file_name, fdi.read_u32::<LE>()?);
                     }
                     directories.insert(dir_name, files);
                 }
@@ -470,29 +505,18 @@ impl Pak {
             let size = index.read_u32::<LE>()? as usize;
             let encoded_entries = index.read_len(size)?;
 
-            let non_encoded_entry_count = index.read_u32::<LE>()? as usize;
-            let mut non_encoded_entries = Vec::with_capacity(non_encoded_entry_count);
-            for _ in 0..non_encoded_entry_count {
-                non_encoded_entries.push(Entry::read(&mut index, version)?);
-            }
-
             let mut entries_by_path = BTreeMap::new();
             if let Some(fdi) = &full_directory_index {
                 let mut encoded_entries = io::Cursor::new(&encoded_entries);
                 for (dir_name, dir) in fdi {
                     for (file_name, encoded_offset) in dir {
-                        // i32::MIN (0x80000000) is a deleted/pruned entry sentinel
-                        // in the UE5 PAK format — skip it to avoid negate overflow.
-                        if *encoded_offset == i32::MIN {
+                        if *encoded_offset == 0x80000000 {
+                            println!("{file_name:?} has invalid offset: 0x{encoded_offset:08x}");
                             continue;
                         }
-                        let entry = if *encoded_offset >= 0 {
-                            encoded_entries.set_position(*encoded_offset as u64);
-                            Entry::read_encoded(&mut encoded_entries, version)?
-                        } else {
-                            let index = (-*encoded_offset) as usize - 1;
-                            non_encoded_entries[index].clone()
-                        };
+                        encoded_entries.seek(io::SeekFrom::Start(*encoded_offset as u64))?;
+                        let entry =
+                            super::entry::Entry::read_encoded(&mut encoded_entries, version)?;
                         let path = format!(
                             "{}{}",
                             dir_name.strip_prefix('/').unwrap_or(dir_name),
@@ -502,6 +526,8 @@ impl Pak {
                     }
                 }
             }
+
+            assert_eq!(index.read_u32::<LE>()?, 0, "remaining index bytes are 0"); // TODO possibly remaining unencoded entries?
 
             Index {
                 path_hash_seed: Some(path_hash_seed),
@@ -522,6 +548,7 @@ impl Pak {
         };
 
         Ok(Pak {
+            profile,
             version,
             mount_point,
             index_offset: Some(footer.index_offset),
@@ -535,7 +562,7 @@ impl Pak {
     fn write<W: Write + Seek>(
         &self,
         writer: &mut W,
-        _key: &super::Key,
+        #[allow(unused)] key: &super::Key,
     ) -> Result<(), super::Error> {
         let index_offset = writer.stream_position()?;
 
@@ -592,58 +619,108 @@ impl Pak {
             //     - Flags (u32)
             //     - Offset (u32)
             //     - Size (u32)
-            let bytes_before_phi = {
-                let mut size = 0;
-                size += 4; // mount point len
-                size += self.mount_point.len() as u64 + 1; // mount point string w/ NUL byte
-                size += 8; // path hash seed
-                size += 4; // record count
-                size += 4; // has path hash index (since we're generating, always true)
-                size += 8 + 8 + 20; // path hash index offset, size and hash
-                size += 4; // has full directory index (since we're generating, always true)
-                size += 8 + 8 + 20; // full directory index offset, size and hash
-                size += 4; // encoded entry size
-                size += encoded_entries.len() as u64;
-                size += 4; // unused file count
-                size
-            };
 
-            let path_hash_index_offset = index_offset + bytes_before_phi;
+            // Write the header with placeholder zeros for the secondary index offset
+            // fields. After building the secondary indices we seek back and fill in the
+            // real values, so no manual size arithmetic is needed.
+            index_writer.write_u32::<LE>(1)?; // we have path hash index
+            let phi_slot = index_writer.position();
+            index_writer.write_all(&[0u8; 8 + 8 + 20])?; // placeholder: offset, size, hash
+
+            index_writer.write_u32::<LE>(1)?; // we have full directory index
+            let fdi_slot = index_writer.position();
+            index_writer.write_all(&[0u8; 8 + 8 + 20])?; // placeholder: offset, size, hash
+
+            index_writer.write_u32::<LE>(encoded_entries.len() as u32)?;
+            index_writer.write_all(&encoded_entries)?;
+            index_writer.write_u32::<LE>(0)?; // unused file count
+
+            // Measure the actual header size (deriving the secondary index offsets from
+            // what was written rather than recalculating it by hand).
+            let mut header_size = index_writer.position();
+            #[cfg(feature = "encryption")]
+            if let crate::Key::Some(_) = key {
+                header_size = pad_length(header_size as usize, 16) as u64;
+            }
+            let path_hash_index_offset = index_offset + header_size;
 
             let mut phi_buf = vec![];
-            let mut phi_writer = io::Cursor::new(&mut phi_buf);
             generate_path_hash_index(
-                &mut phi_writer,
+                &mut io::Cursor::new(&mut phi_buf),
                 path_hash_seed,
                 &self.index.entries,
                 &offsets,
             )?;
+            #[cfg(feature = "encryption")]
+            if let crate::Key::Some(_) = key {
+                crate::data::pad_zeros_to_alignment(&mut phi_buf, 16);
+            }
+            let phi_hash = hash(&phi_buf);
+            #[cfg(feature = "encryption")]
+            if let crate::Key::Some(key) = key {
+                crate::data::encrypt(self.profile, key, &mut phi_buf);
+            }
 
             let full_directory_index_offset = path_hash_index_offset + phi_buf.len() as u64;
 
             let mut fdi_buf = vec![];
-            let mut fdi_writer = io::Cursor::new(&mut fdi_buf);
-            generate_full_directory_index(&mut fdi_writer, &self.index.entries, &offsets)?;
+            generate_full_directory_index(
+                &mut io::Cursor::new(&mut fdi_buf),
+                &self.index.entries,
+                &offsets,
+            )?;
+            #[cfg(feature = "encryption")]
+            if let crate::Key::Some(_) = key {
+                crate::data::pad_zeros_to_alignment(&mut fdi_buf, 16);
+            }
+            let fdi_hash = hash(&fdi_buf);
+            #[cfg(feature = "encryption")]
+            if let crate::Key::Some(key) = key {
+                crate::data::encrypt(self.profile, key, &mut fdi_buf);
+            }
 
-            index_writer.write_u32::<LE>(1)?; // we have path hash index
+            // Backfill the placeholder slots with the real offset/size/hash values.
+            index_writer.seek(io::SeekFrom::Start(phi_slot))?;
             index_writer.write_u64::<LE>(path_hash_index_offset)?;
-            index_writer.write_u64::<LE>(phi_buf.len() as u64)?; // path hash index size
-            index_writer.write_all(&hash(&phi_buf).0)?;
+            index_writer.write_u64::<LE>(phi_buf.len() as u64)?;
+            index_writer.write_all(&phi_hash.0)?;
 
-            index_writer.write_u32::<LE>(1)?; // we have full directory index
+            index_writer.seek(io::SeekFrom::Start(fdi_slot))?;
             index_writer.write_u64::<LE>(full_directory_index_offset)?;
-            index_writer.write_u64::<LE>(fdi_buf.len() as u64)?; // path hash index size
-            index_writer.write_all(&hash(&fdi_buf).0)?;
-
-            index_writer.write_u32::<LE>(encoded_entries.len() as u32)?;
-            index_writer.write_all(&encoded_entries)?;
-
-            index_writer.write_u32::<LE>(0)?;
+            index_writer.write_u64::<LE>(fdi_buf.len() as u64)?;
+            index_writer.write_all(&fdi_hash.0)?;
 
             Some((phi_buf, fdi_buf))
         };
 
-        let index_hash = hash(&index_buf);
+        let mut footer = super::footer::Footer {
+            encryption_uuid: None,
+            encrypted: false,
+            magic: super::MAGIC,
+            version: self.version,
+            version_major: self.version.version_major(),
+            index_offset,
+            index_size: 0,
+            hash: Default::default(),
+            frozen: false,
+            compression: self.compression.clone(),
+        };
+
+        #[cfg(feature = "encryption")]
+        if let crate::Key::Some(key) = key {
+            crate::data::pad_zeros_to_alignment(&mut index_buf, 16);
+            footer.hash = hash(&index_buf);
+            crate::data::encrypt(self.profile, key, &mut index_buf);
+            footer.encrypted = true;
+            footer.encryption_uuid = Some(Default::default());
+        } else {
+            footer.hash = hash(&index_buf);
+        }
+        #[cfg(not(feature = "encryption"))]
+        {
+            footer.hash = hash(&index_buf);
+        }
+        footer.index_size = index_buf.len() as u64;
 
         writer.write_all(&index_buf)?;
 
@@ -652,18 +729,9 @@ impl Pak {
             writer.write_all(&fdi_buf[..])?;
         }
 
-        let footer = super::footer::Footer {
-            encryption_uuid: None,
-            encrypted: false,
-            magic: super::MAGIC,
-            version: self.version,
-            version_major: self.version.version_major(),
-            index_offset,
-            index_size: index_buf.len() as u64,
-            hash: index_hash,
-            frozen: false,
-            compression: self.compression.clone(), // TODO: avoid this clone
-        };
+        if !self.profile.index_trailer.is_empty() {
+            writer.write_all(self.profile.index_trailer)?;
+        }
 
         footer.write(writer)?;
 
@@ -682,7 +750,7 @@ fn generate_path_hash_index<W: Write>(
     writer: &mut W,
     path_hash_seed: u64,
     entries: &BTreeMap<String, super::entry::Entry>,
-    offsets: &Vec<u32>,
+    offsets: &[u32],
 ) -> Result<(), super::Error> {
     writer.write_u32::<LE>(entries.len() as u32)?;
     for (path, offset) in entries.keys().zip(offsets) {
@@ -732,7 +800,7 @@ fn split_path_child(path: &str) -> Option<(&str, &str)> {
 fn generate_full_directory_index<W: Write>(
     writer: &mut W,
     entries: &BTreeMap<String, super::entry::Entry>,
-    offsets: &Vec<u32>,
+    offsets: &[u32],
 ) -> Result<(), super::Error> {
     let mut fdi: BTreeMap<&str, BTreeMap<&str, u32>> = Default::default();
     for (path, offset) in entries.keys().zip(offsets) {
@@ -758,14 +826,6 @@ fn generate_full_directory_index<W: Write>(
     }
 
     Ok(())
-}
-
-#[cfg(feature = "encryption")]
-fn encrypt(key: aes::Aes256, bytes: &mut [u8]) {
-    use aes::cipher::BlockEncrypt;
-    for chunk in bytes.chunks_mut(16) {
-        key.encrypt_block(aes::Block::from_mut_slice(chunk))
-    }
 }
 
 #[cfg(test)]

@@ -99,6 +99,63 @@ As far as I can tell, the index is not necessarily written deterministically by 
 
 `UnrealPak` includes a directory entry in the full directory index for all parent directories back to the pak root for a given file path regardless of whether those directories contain any files or just other directories. `repak` only includes directories that contain files. So far no functional differences have been observed as a result.
 
+## game profiles (fork addition)
+
+This fork extends `repak` with a `PakProfile` API for supporting games that deviate from standard Unreal Engine pak behaviour. The profile is passed to `PakBuilder` and controls how encryption is applied during both reading and writing.
+
+```rust
+pub struct PakProfile {
+    /// Returns how many leading bytes of each file's (possibly compressed) data to encrypt.
+    /// Return `total_len` to encrypt the full file (the default), or a smaller value for
+    /// partial encryption schemes.
+    pub encrypt_prefix: EncryptPrefixFn,
+
+    /// If true, the byte order within each 4-byte word is reversed before and after each
+    /// AES block operation. Some games use this as an additional cipher layer.
+    pub reverse_word_order: bool,
+
+    /// Extra bytes appended after the index, before the footer. Use an empty slice if
+    /// your target game does not write a trailer.
+    pub index_trailer: &'static [u8],
+}
+```
+
+`PakProfile` implements `Default`, which disables all modifications — fully compatible with standard UE pak files.
+
+### implementing a custom profile
+
+```rust
+use repak::{PakBuilder, PakProfile};
+
+fn my_encrypt_prefix(_mount_point: &str, path: &str, total_len: usize) -> usize {
+    // Encrypt only the first 4096 bytes of every file, or the whole file if smaller.
+    total_len.min(4096)
+}
+
+static MY_TRAILER: &[u8] = &[0x01, 0x02, 0x03, 0x04];
+
+let profile = PakProfile {
+    encrypt_prefix: my_encrypt_prefix,
+    reverse_word_order: true,
+    index_trailer: MY_TRAILER,
+};
+
+// Pass the profile to the builder before constructing a reader or writer.
+let reader = PakBuilder::new()
+    .profile(profile)
+    .key(aes_key)
+    .reader(&mut buf_reader)?;
+```
+
+If only some fields differ from the default, use struct update syntax:
+
+```rust
+let profile = PakProfile {
+    reverse_word_order: true,
+    ..PakProfile::default()
+};
+```
+
 ## acknowledgements
 - [unpak](https://github.com/bananaturtlesandwich/unpak): original crate featuring read-only pak operations
 - [rust-u4pak](https://github.com/panzi/rust-u4pak)'s README detailing the pak file layout
