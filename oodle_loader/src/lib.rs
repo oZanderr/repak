@@ -1,4 +1,3 @@
-use std::sync::OnceLock;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -97,56 +96,40 @@ mod oodle_lz {
     pub type SetPrintf = unsafe extern "system" fn(printf: *const ());
 }
 
-static OODLE_VERSION: &str = "2.9.10";
-static OODLE_BASE_URL: &str = "https://github.com/WorkingRobot/OodleUE/raw/refs/heads/main/Engine/Source/Programs/Shared/EpicGames.Oodle/Sdk/";
-
 struct OodlePlatform {
-    path: &'static str,
     name: &'static str,
     hash: &'static str,
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 static OODLE_PLATFORM: OodlePlatform = OodlePlatform {
-    path: "linux/lib",
     name: "liboo2corelinux64.so.9",
     hash: "ed7e98f70be1254a80644efd3ae442ff61f854a2fe9debb0b978b95289884e9c",
 };
 
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 static OODLE_PLATFORM: OodlePlatform = OodlePlatform {
-    path: "linuxarm/lib",
     name: "liboo2corelinuxarm64.so.9",
     hash: "161a8ecca8cc2d4ea6469779c2cc529ed5bb2765d99466273c29fdbef4657374",
 };
 
 #[cfg(all(target_os = "linux", target_arch = "arm"))]
 static OODLE_PLATFORM: OodlePlatform = OodlePlatform {
-    path: "linuxarm/lib",
     name: "liboo2corelinuxarm32.so.9",
     hash: "83cda016c033844fe650e49fac4cc19ff0a0fb4a3c9a7576a320ea39a9e4626b",
 };
 
 #[cfg(target_os = "macos")]
 static OODLE_PLATFORM: OodlePlatform = OodlePlatform {
-    path: "mac/lib",
     name: "liboo2coremac64.2.9.10.dylib",
     hash: "b09af35f6b84a61e2b6488495c7927e1cef789b969128fa1c845e51a475ec501",
 };
 
 #[cfg(windows)]
 static OODLE_PLATFORM: OodlePlatform = OodlePlatform {
-    path: "win/redist",
     name: "oo2core_9_win64.dll",
     hash: "6f5d41a7892ea6b2db420f2458dad2f84a63901c9a93ce9497337b16c195f457",
 };
-
-fn url() -> String {
-    format!(
-        "{OODLE_BASE_URL}/{}/{}/{}",
-        OODLE_VERSION, OODLE_PLATFORM.path, OODLE_PLATFORM.name
-    )
-}
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -154,19 +137,16 @@ pub enum Error {
     HashMismatch { expected: String, found: String },
     #[error("Oodle compression failed")]
     CompressionFailed,
-    #[error("Oodle initialization failed previously")]
-    InitializationFailed,
+    #[error("Oodle decompression failed")]
+    DecompressionFailed,
     #[error("IO error {0:?}")]
     Io(#[from] std::io::Error),
-    #[error("ureq error {0:?}")]
-    Ureq(Box<ureq::Error>),
+    #[error("Oodle library not found; place {name} beside the executable or set OODLE_LIB_PATH")]
+    MissingLocalLibrary { name: &'static str },
+    #[error("Oodle initialization failed previously: {cause}")]
+    InitializationFailed { cause: String },
     #[error("Oodle libloading error {0:?}")]
     LibLoading(#[from] libloading::Error),
-}
-impl From<ureq::Error> for Error {
-    fn from(value: ureq::Error) -> Self {
-        Self::Ureq(value.into())
-    }
 }
 
 fn check_hash(buffer: &[u8]) -> Result<()> {
@@ -185,16 +165,20 @@ fn check_hash(buffer: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn fetch_oodle() -> Result<std::path::PathBuf> {
-    let oodle_path = std::env::current_exe()?.with_file_name(OODLE_PLATFORM.name);
-    if !oodle_path.exists() {
-        let buffer = ureq::get(&url()).call()?.into_body().read_to_vec()?;
-        check_hash(&buffer)?;
-        std::fs::write(&oodle_path, buffer)?;
-    }
-    // don't check existing file to allow user to substitute other versions
-    // check_hash(&std::fs::read(&oodle_path)?)?;
-    Ok(oodle_path)
+fn resolve_oodle_path() -> Result<std::path::PathBuf> {
+    let env_path = std::env::var("OODLE_LIB_PATH").ok().map(|p| {
+        let p = std::path::PathBuf::from(p);
+        if p.is_dir() { p.join(OODLE_PLATFORM.name) } else { p }
+    });
+
+    let path = env_path.into_iter()
+        .chain(std::env::current_exe().ok().map(|e| e.with_file_name(OODLE_PLATFORM.name)))
+        .chain(std::env::current_dir().ok().map(|d| d.join(OODLE_PLATFORM.name)))
+        .find(|p| p.is_file())
+        .ok_or(Error::MissingLocalLibrary { name: OODLE_PLATFORM.name })?;
+
+    check_hash(&std::fs::read(&path)?)?;
+    Ok(path)
 }
 
 pub struct Oodle {
@@ -202,22 +186,23 @@ pub struct Oodle {
     compress: oodle_lz::Compress,
     decompress: oodle_lz::Decompress,
     get_compressed_buffer_size_needed: oodle_lz::GetCompressedBufferSizeNeeded,
-    set_printf: oodle_lz::SetPrintf,
 }
 impl Oodle {
     fn new(lib: libloading::Library) -> Result<Self> {
-        unsafe {
-            let res = Oodle {
+        let res = unsafe {
+            // Silence Oodle's default printf output; loaded and called once, no need to retain.
+            let set_printf: oodle_lz::SetPrintf = *lib.get(b"OodleCore_Plugins_SetPrintf")?;
+            set_printf(std::ptr::null());
+
+            Oodle {
                 compress: *lib.get(b"OodleLZ_Compress")?,
                 decompress: *lib.get(b"OodleLZ_Decompress")?,
                 get_compressed_buffer_size_needed: *lib
                     .get(b"OodleLZ_GetCompressedBufferSizeNeeded")?,
-                set_printf: *lib.get(b"OodleCore_Plugins_SetPrintf")?,
                 _library: lib,
-            };
-            (res.set_printf)(std::ptr::null()); // silence oodle logging
-            Ok(res)
-        }
+            }
+        };
+        Ok(res)
     }
     pub fn compress(
         &self,
@@ -225,11 +210,11 @@ impl Oodle {
         compressor: Compressor,
         compression_level: CompressionLevel,
     ) -> Result<Vec<u8>> {
-        unsafe {
-            let buffer_size = self.get_compressed_buffer_size_needed(compressor, input.len());
-            let mut buffer = vec![0; buffer_size];
+        let buffer_size = self.get_compressed_buffer_size_needed(compressor, input.len());
+        let mut buffer = vec![0; buffer_size];
 
-            let len = (self.compress)(
+        let len = unsafe {
+            (self.compress)(
                 compressor,
                 input.as_ptr(),
                 input.len(),
@@ -240,35 +225,39 @@ impl Oodle {
                 std::ptr::null(),
                 std::ptr::null_mut(),
                 0,
-            );
+            )
+        };
 
-            if len == -1 {
-                return Err(Error::CompressionFailed);
-            }
-            buffer.truncate(len as usize);
-
-            Ok(buffer)
+        if len == -1 {
+            return Err(Error::CompressionFailed);
         }
+        buffer.truncate(len as usize);
+
+        Ok(buffer)
     }
-    pub fn decompress(&self, input: &[u8], output: &mut [u8]) -> isize {
-        unsafe {
+    pub fn decompress(&self, input: &[u8], output: &mut [u8]) -> Result<usize> {
+        let len = unsafe {
             (self.decompress)(
                 input.as_ptr(),
                 input.len(),
                 output.as_mut_ptr(),
                 output.len(),
-                1,
-                1,
-                0,
-                0,
-                0,
-                0,
-                0,
-                std::ptr::null_mut(),
-                0,
-                3,
+                1,             // fuzzSafe
+                1,             // checkCRC
+                0,             // verbosity
+                0,             // decBufBase
+                0,             // decBufSize
+                0,             // fpCallback
+                0,             // callbackUserData
+                std::ptr::null_mut(), // decoderMemory (let Oodle allocate)
+                0,             // decoderMemorySize
+                3,             // threadPhase (OodleLZ_Decode_ThreadPhaseAll)
             )
+        };
+        if len < 0 {
+            return Err(Error::DecompressionFailed);
         }
+        Ok(len as usize)
     }
     fn get_compressed_buffer_size_needed(
         &self,
@@ -279,33 +268,19 @@ impl Oodle {
     }
 }
 
-static OODLE: OnceLock<Option<Oodle>> = OnceLock::new();
-
 fn load_oodle() -> Result<Oodle> {
-    let path = fetch_oodle()?;
-    unsafe {
-        let library = libloading::Library::new(path)?;
-        Oodle::new(library)
-    }
+    let path = resolve_oodle_path()?;
+    let library = unsafe { libloading::Library::new(path)? };
+    Oodle::new(library)
 }
 
+// LazyLock initialises on first access. The inner Result uses String for the error because
+// Error is not Clone, and LazyLock needs to hand out &T from a shared static.
+static OODLE: std::sync::LazyLock<std::result::Result<Oodle, String>> =
+    std::sync::LazyLock::new(|| load_oodle().map_err(|e| e.to_string()));
+
 pub fn oodle() -> Result<&'static Oodle> {
-    let mut result = None;
-    let oodle = OODLE.get_or_init(|| match load_oodle() {
-        Err(err) => {
-            result = Some(Err(err));
-            None
-        }
-        Ok(oodle) => Some(oodle),
-    });
-    match (result, oodle) {
-        // oodle initialized so return
-        (_, Some(oodle)) => Ok(oodle),
-        // error during initialization
-        (Some(result), _) => result?,
-        // no error because initialization was tried and failed before
-        _ => Err(Error::InitializationFailed),
-    }
+    OODLE.as_ref().map_err(|e| Error::InitializationFailed { cause: e.clone() })
 }
 
 #[cfg(test)]
@@ -329,7 +304,7 @@ mod test {
         dbg!((data.len(), buffer.len()));
 
         let mut uncomp = vec![0; data.len()];
-        oodle.decompress(&buffer, &mut uncomp);
+        oodle.decompress(&buffer, &mut uncomp).unwrap();
 
         assert_eq!(data[..], uncomp[..]);
     }
