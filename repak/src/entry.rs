@@ -351,11 +351,28 @@ impl Entry {
         #[cfg(any(feature = "compression", feature = "oodle"))]
         let data_offset = reader.stream_position()?;
 
+        // Encrypted multi-block entries: each block is AES-padded independently,
+        // so total on-disk size = sum(align(block_i)) >= align(total_compressed).
         #[allow(unused_mut)]
-        let mut data = reader.read_len(match self.is_encrypted() {
-            true => align(self.compressed),
-            false => self.compressed,
-        } as usize)?;
+        let mut data = reader.read_len(if self.is_encrypted() {
+            match &self.blocks {
+                Some(blocks) if blocks.len() > 1 => {
+                    // Block offsets are relative to entry start; subtract the
+                    // already-consumed entry header to index into our data buffer.
+                    let offset_base = Entry::get_serialized_size(
+                        version,
+                        self.compression_slot,
+                        blocks.len() as u32,
+                    );
+                    let last = &blocks[blocks.len() - 1];
+                    // Align last block end to get true on-disk read size.
+                    align(last.end - offset_base) as usize
+                }
+                _ => align(self.compressed) as usize,
+            }
+        } else {
+            self.compressed as usize
+        })?;
 
         let limit = (profile.encrypt_prefix)(mount_point, path, data.len()).min(data.len());
 
@@ -364,7 +381,41 @@ impl Entry {
             return Err(super::Error::Encryption);
             #[cfg(feature = "encryption")]
             {
-                crate::data::decrypt(profile, key, &mut data[..limit])?;
+                // Partial encryption with multiple blocks: decrypt each block's
+                // prefix independently with a rolling byte limit.
+                // Mirrors CUE4Parse PartialEncryptCompressedExtract.
+                let is_partial = limit < data.len();
+                if is_partial && self.blocks.as_ref().is_some_and(|b| b.len() > 1) {
+                    let blocks = self.blocks.as_ref().unwrap();
+
+                    #[cfg(any(feature = "compression", feature = "oodle"))]
+                    let to_offset = |index: u64| -> usize {
+                        (match version.version_major() >= VersionMajor::RelativeChunkOffsets {
+                            true => index - (data_offset - self.offset),
+                            false => index - data_offset,
+                        }) as usize
+                    };
+
+                    let mut remaining_limit = limit;
+                    for block in blocks {
+                        if remaining_limit == 0 {
+                            break;
+                        }
+                        let block_start = to_offset(block.start);
+                        let block_size = (block.end - block.start) as usize;
+                        let aligned_block_size = align(block_size as u64) as usize;
+                        let decrypt_len = if block_size < remaining_limit && remaining_limit > 0 {
+                            aligned_block_size
+                        } else {
+                            remaining_limit
+                        };
+                        let decrypt_end = (block_start + decrypt_len).min(data.len());
+                        crate::data::decrypt(profile, key, &mut data[block_start..decrypt_end])?;
+                        remaining_limit = remaining_limit.saturating_sub(aligned_block_size);
+                    }
+                } else {
+                    crate::data::decrypt(profile, key, &mut data[..limit])?;
+                }
                 data.truncate(self.compressed as usize);
             }
         }
