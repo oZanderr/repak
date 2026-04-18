@@ -37,6 +37,12 @@ pub(crate) fn decrypt(
 ) -> Result<(), super::Error> {
     if let super::Key::Some(key) = key {
         use aes::cipher::BlockDecrypt;
+        if !bytes.len().is_multiple_of(16) {
+            return Err(super::Error::Other(format!(
+                "encrypted payload size {} is not a multiple of AES block size 16",
+                bytes.len()
+            )));
+        }
         for chunk in bytes.chunks_mut(16) {
             if profile.reverse_word_order {
                 chunk.chunks_mut(4).for_each(|c| c.reverse());
