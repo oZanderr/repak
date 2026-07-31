@@ -150,3 +150,32 @@ impl From<aes::Aes256> for Key {
         Self::Some(value)
     }
 }
+
+/// Maps container encryption-key GUIDs to AES keys so the reader can pick the key that matches
+/// the pak footer's `EncryptionKeyGuid` instead of relying on a single key. GUIDs are the little
+/// endian `u128` read from the footer (the raw `FGuid` bytes), matching
+/// [`PakReader::encryption_guid`]. A pak whose GUID is absent falls back to [`PakBuilder::key`].
+#[derive(Debug, Default, Clone)]
+pub struct KeyChain {
+    #[cfg(feature = "encryption")]
+    keys: std::collections::HashMap<u128, aes::Aes256>,
+}
+
+#[cfg(feature = "encryption")]
+impl KeyChain {
+    pub fn insert(&mut self, guid: u128, key: aes::Aes256) {
+        self.keys.insert(guid, key);
+    }
+    pub(crate) fn get(&self, guid: u128) -> Option<&aes::Aes256> {
+        self.keys.get(&guid)
+    }
+}
+
+#[cfg(feature = "encryption")]
+impl FromIterator<(u128, aes::Aes256)> for KeyChain {
+    fn from_iter<I: IntoIterator<Item = (u128, aes::Aes256)>>(iter: I) -> Self {
+        Self {
+            keys: iter.into_iter().collect(),
+        }
+    }
+}

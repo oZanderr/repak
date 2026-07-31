@@ -20,6 +20,7 @@ impl std::fmt::Debug for Hash {
 #[derive(Debug)]
 pub struct PakBuilder {
     key: super::Key,
+    keys: super::KeyChain,
     allowed_compression: Vec<Compression>,
     profile: PakProfile,
     oodle_level: crate::data::OodleLevelOpt,
@@ -35,6 +36,7 @@ impl PakBuilder {
     pub fn new() -> Self {
         Self {
             key: Default::default(),
+            keys: Default::default(),
             allowed_compression: Default::default(),
             profile: Default::default(),
             oodle_level: None,
@@ -43,6 +45,13 @@ impl PakBuilder {
     #[cfg(feature = "encryption")]
     pub fn key(mut self, key: aes::Aes256) -> Self {
         self.key = super::Key::Some(key);
+        self
+    }
+    /// Provide keys keyed by container GUID; the reader picks the one matching the pak footer,
+    /// falling back to [`PakBuilder::key`] when the GUID is absent from the chain.
+    #[cfg(feature = "encryption")]
+    pub fn keys(mut self, keys: super::KeyChain) -> Self {
+        self.keys = keys;
         self
     }
     #[cfg(feature = "compression")]
@@ -63,14 +72,14 @@ impl PakBuilder {
         self
     }
     pub fn reader<R: Read + Seek>(self, reader: &mut R) -> Result<PakReader, super::Error> {
-        PakReader::new_any_inner(reader, self.key, self.profile)
+        PakReader::new_any_inner(reader, self.key, self.keys, self.profile)
     }
     pub fn reader_with_version<R: Read + Seek>(
         self,
         reader: &mut R,
         version: super::Version,
     ) -> Result<PakReader, super::Error> {
-        PakReader::new_inner(reader, version, self.key, self.profile)
+        PakReader::new_inner(reader, version, self.key, self.keys, self.profile)
     }
     pub fn writer<W: Write + Seek>(
         self,
@@ -178,14 +187,15 @@ impl PakReader {
     fn new_any_inner<R: Read + Seek>(
         reader: &mut R,
         key: super::Key,
+        keys: super::KeyChain,
         profile: PakProfile,
     ) -> Result<Self, super::Error> {
         use std::fmt::Write;
         let mut log = "\n".to_owned();
 
         for ver in Version::iter() {
-            match Pak::read(&mut *reader, ver, &key, profile) {
-                Ok(pak) => return Ok(Self { pak, key }),
+            match Pak::read(&mut *reader, ver, &key, &keys, profile) {
+                Ok((pak, key)) => return Ok(Self { pak, key }),
                 Err(err) => writeln!(log, "trying version {} failed: {}", ver, err)?,
             }
         }
@@ -196,9 +206,10 @@ impl PakReader {
         reader: &mut R,
         version: super::Version,
         key: super::Key,
+        keys: super::KeyChain,
         profile: PakProfile,
     ) -> Result<Self, super::Error> {
-        Pak::read(reader, version, &key, profile).map(|pak| Self { pak, key })
+        Pak::read(reader, version, &key, &keys, profile).map(|(pak, key)| Self { pak, key })
     }
 
     pub fn version(&self) -> super::Version {
@@ -444,8 +455,9 @@ impl Pak {
         reader: &mut R,
         version: super::Version,
         #[allow(unused)] key: &super::Key,
+        #[allow(unused)] keys: &super::KeyChain,
         profile: PakProfile,
-    ) -> Result<Self, super::Error> {
+    ) -> Result<(Self, super::Key), super::Error> {
         // read footer to get index, encryption & compression info
         reader.seek(io::SeekFrom::End(-version.size()))?;
         let footer = super::footer::Footer::read(reader, version)?;
@@ -455,12 +467,20 @@ impl Pak {
         #[allow(unused_mut)]
         let mut index = reader.read_len(footer.index_size as usize)?;
 
+        // Pick the key whose GUID matches this pak's footer, falling back to the single key.
+        #[allow(unused_mut)]
+        let mut selected = key.clone();
+        #[cfg(feature = "encryption")]
+        if let Some(k) = footer.encryption_uuid.and_then(|g| keys.get(g)) {
+            selected = super::Key::Some(k.clone());
+        }
+
         // decrypt index if needed
         if footer.encrypted {
             #[cfg(not(feature = "encryption"))]
             return Err(super::Error::Encryption);
             #[cfg(feature = "encryption")]
-            crate::data::decrypt(profile, key, &mut index)?;
+            crate::data::decrypt(profile, &selected, &mut index)?;
         }
 
         let mut index = io::Cursor::new(index);
@@ -489,7 +509,7 @@ impl Pak {
                     #[cfg(not(feature = "encryption"))]
                     return Err(super::Error::Encryption);
                     #[cfg(feature = "encryption")]
-                    crate::data::decrypt(profile, key, &mut buf)?;
+                    crate::data::decrypt(profile, &selected, &mut buf)?;
                 }
                 Some(buf)
             } else {
@@ -573,16 +593,19 @@ impl Pak {
             }
         };
 
-        Ok(Pak {
-            profile,
-            version,
-            mount_point,
-            index_offset: Some(footer.index_offset),
-            index,
-            encrypted_index: footer.encrypted,
-            encryption_guid: footer.encryption_uuid,
-            compression: footer.compression,
-        })
+        Ok((
+            Pak {
+                profile,
+                version,
+                mount_point,
+                index_offset: Some(footer.index_offset),
+                index,
+                encrypted_index: footer.encrypted,
+                encryption_guid: footer.encryption_uuid,
+                compression: footer.compression,
+            },
+            selected,
+        ))
     }
 
     fn write<W: Write + Seek>(
